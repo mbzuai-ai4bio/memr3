@@ -33,8 +33,21 @@ class MaskedRetriever:
             print(f"[Retriever] Using cross-encoder rerank model: {rerank_model}")
 
     def embed(self, text: str) -> List[float]:
-        response = self.client.embeddings.create(model=self.embedding_model, input=text)
-        return response.data[0].embedding
+        max_retries = max(0, int(os.getenv("MEMR3_RAG_EMBED_RETRIES", "5")))
+        retry_delay = max(
+            0, int(os.getenv("MEMR3_RAG_EMBED_RETRY_DELAY_SECONDS", "20"))
+        )
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.embeddings.create(
+                    model=self.embedding_model, input=text
+                )
+                return response.data[0].embedding
+            except Exception:
+                if attempt == max_retries:
+                    raise
+                time.sleep(retry_delay)
+        raise RuntimeError("Unreachable embedding retry state.")
 
     def retrieve(
         self, query: str, chunks: List[str], embeddings: List[List[float]], mask: List[int], top_k: int

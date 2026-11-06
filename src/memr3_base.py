@@ -134,8 +134,9 @@ class MemoryState(TypedDict, total=False):
     iteration_count: int
     consecutive_reflects: int
     total_retrieved_tokens: int
+    total_input_tokens: int
     total_completion_tokens: int
-    last_retrieved_token_iteration: Optional[int]
+    last_retrieved_token_search_count: Optional[int]
     langmem_retriever: Any
     speakers: List[str]
     speaker_cursor: int
@@ -158,6 +159,8 @@ class BaseMemR3Manager(ABC):
             api_key=os.environ.get("OPENAI_API_KEY"),
             base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         )
+        # Optional provider-specific request fields (e.g. OpenRouter reasoning/provider routing), as JSON.
+        self.llm_extra_body = json.loads(os.environ.get("MEMR3_LLM_EXTRA_BODY") or "{}") or None
 
         target_model_for_encoding = os.getenv("EMBEDDING_MODEL") or self.model
         try:
@@ -223,14 +226,17 @@ class BaseMemR3Manager(ABC):
             last_error = ""
             for attempt in range(max_retries + 1):
                 try:
+                    started_at = time.time()
                     response = self.client.chat.completions.create(
                         model=self.model,
                         temperature=0,
+                        extra_body=self.llm_extra_body,
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt},
                         ],
                     )
+                    self._record_response_time(state, time.time() - started_at)
                     self._record_usage(state, response)
                     content = response.choices[0].message.content.strip()
                     # print(f"[Generation Output] {content}")
@@ -344,7 +350,7 @@ class BaseMemR3Manager(ABC):
                 draft_answer=state.get("pending_answer"),
             )
             state["answer"] = answer
-            state["response_time"] = round(duration, 3)
+            self._record_response_time(state, duration)
             return state
 
         workflow.add_node("generation", generation_node)
@@ -464,6 +470,10 @@ class BaseMemR3Manager(ABC):
         except Exception:
             return len(text.split())
 
+    @staticmethod
+    def _record_response_time(state: MemoryState, duration: float) -> None:
+        state["response_time"] = state.get("response_time", 0.0) + duration
+
     def _record_retrieved_tokens(self, state: MemoryState) -> None:
         raw_snippets = state.get("raw_snippets") or []
         if not raw_snippets:
@@ -472,29 +482,40 @@ class BaseMemR3Manager(ABC):
         raw_block = "\n---\n".join(str(snippet) for snippet in raw_snippets)
         tokens = self._count_tokens(raw_block)
 
-        iteration = state.get("iteration_count")
-        last_counted = state.get("last_retrieved_token_iteration")
+        # Reflect steps advance iteration_count without performing another retrieval.
+        search_count = len(state.get("search_times", []))
+        last_counted = state.get("last_retrieved_token_search_count")
 
-        if iteration is not None and last_counted == iteration:
+        if last_counted == search_count:
             return
 
         state["total_retrieved_tokens"] = state.get("total_retrieved_tokens", 0) + tokens
-        state["last_retrieved_token_iteration"] = iteration
+        state["last_retrieved_token_search_count"] = search_count
 
-    def _record_usage(self, state: MemoryState, response: Any):
+    def _record_llm_usage(self, state: MemoryState, response: Any) -> None:
         if state is None:
             return
-
-        self._record_retrieved_tokens(state)
 
         usage = getattr(response, "usage", None)
         if usage is None:
             return
 
+        input_tokens = self._extract_usage_value(
+            usage,
+            ["prompt_tokens", "input_tokens", "prompt_tokens_total", "input_tokens_total"],
+        )
         completion_tokens = self._extract_usage_value(
             usage, ["completion_tokens", "completion_tokens_total"]
         )
+        state["total_input_tokens"] = state.get("total_input_tokens", 0) + input_tokens
         state["total_completion_tokens"] = state.get("total_completion_tokens", 0) + completion_tokens
+
+    def _record_usage(self, state: MemoryState, response: Any) -> None:
+        if state is None:
+            return
+
+        self._record_retrieved_tokens(state)
+        self._record_llm_usage(state, response)
 
     @staticmethod
     def _append_evidence_gap_snapshot(state: MemoryState, iteration: int, decision: str) -> None:
@@ -530,6 +551,7 @@ class BaseMemR3Manager(ABC):
                 response = self.client.chat.completions.create(
                     model=self.model,
                     temperature=0.0,
+                    extra_body=self.llm_extra_body,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": question},
@@ -560,7 +582,7 @@ class BaseMemR3Manager(ABC):
             draft_answer=state.get("pending_answer"),
         )
         state["answer"] = answer
-        state["response_time"] = round(duration_raw, 3)
+        self._record_response_time(state, duration_raw)
         state.setdefault("routing_trace", []).append("Answer generated after workflow terminated early.")
         return state
 
@@ -588,8 +610,9 @@ class BaseMemR3Manager(ABC):
             "iteration_count": 0,
             "consecutive_reflects": 0,
             "total_retrieved_tokens": 0,
+            "total_input_tokens": 0,
             "total_completion_tokens": 0,
-            "last_retrieved_token_iteration": None,
+            "last_retrieved_token_search_count": None,
             "retrieval_queries": [],
             "forced_decision": None,
             "last_seen_retrieval_attempts": 0,
@@ -773,6 +796,7 @@ class BaseMemR3Manager(ABC):
         response_text = state.get("answer", "")
         evidence = self._normalize_evidence(state.get("evidence"))
         retrieved_tokens = state.get("total_retrieved_tokens", 0)
+        input_tokens = state.get("total_input_tokens", 0)
         completion_tokens = state.get("total_completion_tokens", 0)
         conversation_id = state.get("conversation_id")
 
@@ -791,5 +815,6 @@ class BaseMemR3Manager(ABC):
             "search_time": total_search_time,
             "response_time": response_time,
             "retrieved_tokens": retrieved_tokens,
+            "input_tokens": input_tokens,
             "completion_tokens": completion_tokens,
         }
